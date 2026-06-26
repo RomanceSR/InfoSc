@@ -4,7 +4,7 @@ PowerShell + LibreHardwareMonitorLib.dll kalici subprocess
 Yonetici olarak calistir -> CPU/GPU/anakart sicakliklari
 """
 import tkinter as tk
-import psutil, threading, subprocess, sys, time, os, tempfile
+import psutil, threading, subprocess, sys, time, os
 from datetime import datetime
 
 # ─── Sabitler ────────────────────────────────────────────────────────────────
@@ -136,8 +136,23 @@ _ps_script  = None
 _lhm_ok     = False
 
 def _dll_path():
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, "LibreHardwareMonitorLib.dll")
+    name = "LibreHardwareMonitorLib.dll"
+    # PyInstaller onefile
+    if getattr(sys, "_MEIPASS", None):
+        return os.path.join(sys._MEIPASS, name)
+    # Nuitka onefile: DLL is next to the exe
+    p = os.path.join(os.path.dirname(sys.executable), name)
+    if os.path.exists(p):
+        return p
+    # Dev / Nuitka standalone
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+def _appdata_dir():
+    d = os.path.join(os.environ.get("LOCALAPPDATA",
+                     os.environ.get("APPDATA", os.path.dirname(sys.executable))),
+                     "HWMonitorPro")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 def _ps_readline_timeout(proc, timeout=6.0):
     q = []
@@ -154,8 +169,8 @@ def lhm_start():
     dll = _dll_path()
     if not os.path.exists(dll):
         return False
-    fd, path = tempfile.mkstemp(suffix=".ps1", prefix="hwmon_lhm_")
-    os.close(fd)
+    # AppData klasorune yaz: temp klasoru yerine daha az suphe ceker
+    path = os.path.join(_appdata_dir(), "lhm_sensor.ps1")
     with open(path, "w", encoding="utf-8") as f:
         f.write(_LHM_PS)
     _ps_script = path
@@ -240,9 +255,6 @@ def lhm_stop():
             _ps_proc.kill()
     _ps_proc = None
     _lhm_ok = False
-    if _ps_script and os.path.exists(_ps_script):
-        try: os.remove(_ps_script)
-        except: pass
 
 # ─── nvidia-smi (GPU yedek) ──────────────────────────────────────────────────
 _nvd_ok = None

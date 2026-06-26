@@ -21,8 +21,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python dependencies
-        run: pip install psutil pyinstaller
+      - name: Install dependencies
+        run: pip install psutil nuitka ordered-set zstandard
 
       - name: Download LibreHardwareMonitor DLL
         shell: powershell
@@ -36,25 +36,36 @@ jobs:
           Copy-Item $dll.FullName -Destination "LibreHardwareMonitorLib.dll"
           Write-Output "DLL hazir: $(Test-Path 'LibreHardwareMonitorLib.dll')"
 
-      - name: Build Windows EXE
+      - name: Build with Nuitka
         run: >
-          pyinstaller --onefile --windowed --uac-admin --name HWMonitor
-          --add-data "LibreHardwareMonitorLib.dll;."
+          python -m nuitka
+          --onefile
+          --windows-console-mode=disable
+          --windows-uac-admin
+          --enable-plugin=tk-inter
+          --include-data-files=LibreHardwareMonitorLib.dll=LibreHardwareMonitorLib.dll
+          --output-filename=HWMonitor.exe
+          --assume-yes-for-downloads
+          --company-name="HWMonitorPro"
+          --product-name="HWMonitor Pro"
+          --file-description="Donanim Sicaklik Monitoru"
+          --file-version=1.0.0.0
+          --product-version=1.0.0.0
           temp_monitor.py
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
           name: HWMonitor-Windows
-          path: dist/HWMonitor.exe
+          path: HWMonitor.exe
           if-no-files-found: error
 
       - name: Commit EXE to branch
         run: |
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
-          git add dist/HWMonitor.exe
-          git diff --cached --quiet || git commit -m "ci: HWMonitor.exe PowerShell+LHM [skip ci]"
+          git add HWMonitor.exe
+          git diff --cached --quiet || git commit -m "ci: HWMonitor.exe Nuitka build [skip ci]"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
