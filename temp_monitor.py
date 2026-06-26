@@ -260,17 +260,17 @@ class Bar(tk.Canvas):
     def __init__(self, parent, w=260, h=16, **kw):
         super().__init__(parent, width=w, height=h, bg=BG2,
                          highlightthickness=0, **kw)
-        self._w, self._h = w, h
+        self._bar_w, self._bar_h = w, h  # _w/_h are reserved by tkinter internals
 
     def set_val(self, pct, color="#00DD88", label=None):
         self.delete("all")
-        self.create_rectangle(0, 0, self._w, self._h,
+        self.create_rectangle(0, 0, self._bar_w, self._bar_h,
                               fill="#2a2a3e", outline="#333355")
-        fw = int(self._w * min(max(pct, 0), 100) / 100)
+        fw = int(self._bar_w * min(max(pct, 0), 100) / 100)
         if fw:
-            self.create_rectangle(0, 0, fw, self._h, fill=color, outline="")
+            self.create_rectangle(0, 0, fw, self._bar_h, fill=color, outline="")
         txt = label or f"{pct:.0f}%"
-        self.create_text(self._w // 2, self._h // 2, text=txt,
+        self.create_text(self._bar_w // 2, self._bar_h // 2, text=txt,
                          fill="white", font=("Consolas", 8, "bold"))
 
 
