@@ -1,4 +1,4 @@
-﻿name: Build Windows EXE
+name: Build Windows EXE
 
 on:
   push:
@@ -16,16 +16,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install psutil pyinstaller wmi
+      - name: Install Python dependencies
+        run: pip install psutil pyinstaller pythonnet wmi
+
+      - name: Download LibreHardwareMonitor DLL
+        shell: powershell
+        run: |
+          $releases = Invoke-RestMethod "https://api.github.com/repos/LibreHardwareMonitor/LibreHardwareMonitor/releases/latest"
+          $zipUrl   = ($releases.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1).browser_download_url
+          Write-Output "Downloading: $zipUrl"
+          Invoke-WebRequest -Uri $zipUrl -OutFile lhm.zip
+          Expand-Archive -Path lhm.zip -DestinationPath lhm_dir -Force
+          $dll = Get-ChildItem -Path lhm_dir -Filter "LibreHardwareMonitorLib.dll" -Recurse | Select-Object -First 1
+          Copy-Item $dll.FullName -Destination "LibreHardwareMonitorLib.dll"
+          Write-Output "DLL kopyalandi: $(Test-Path 'LibreHardwareMonitorLib.dll')"
 
       - name: Build Windows EXE
-        run: pyinstaller --onefile --windowed --name HWMonitor temp_monitor.py
+        run: >
+          pyinstaller --onefile --windowed --uac-admin --name HWMonitor
+          --add-data "LibreHardwareMonitorLib.dll;."
+          --hidden-import clr
+          --hidden-import clr._bootstrap
+          --hidden-import clr.interop
+          --hidden-import wmi
+          temp_monitor.py
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
@@ -34,12 +53,12 @@ jobs:
           path: dist/HWMonitor.exe
           if-no-files-found: error
 
-      - name: Commit and push EXE to branch
+      - name: Commit EXE to branch
         run: |
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
           git add dist/HWMonitor.exe
-          git diff --cached --quiet || git commit -m "ci: add compiled Windows EXE [skip ci]"
+          git diff --cached --quiet || git commit -m "ci: HWMonitor.exe with LHM DLL bundled [skip ci]"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
