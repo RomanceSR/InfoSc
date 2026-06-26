@@ -22,7 +22,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
-        run: pip install psutil pyinstaller pythonnet wmi
+        run: pip install psutil pyinstaller
 
       - name: Download LibreHardwareMonitor DLL
         shell: powershell
@@ -34,16 +34,12 @@ jobs:
           Expand-Archive -Path lhm.zip -DestinationPath lhm_dir -Force
           $dll = Get-ChildItem -Path lhm_dir -Filter "LibreHardwareMonitorLib.dll" -Recurse | Select-Object -First 1
           Copy-Item $dll.FullName -Destination "LibreHardwareMonitorLib.dll"
-          Write-Output "DLL kopyalandi: $(Test-Path 'LibreHardwareMonitorLib.dll')"
+          Write-Output "DLL hazir: $(Test-Path 'LibreHardwareMonitorLib.dll')"
 
       - name: Build Windows EXE
         run: >
           pyinstaller --onefile --windowed --uac-admin --name HWMonitor
           --add-data "LibreHardwareMonitorLib.dll;."
-          --hidden-import clr
-          --hidden-import clr._bootstrap
-          --hidden-import clr.interop
-          --hidden-import wmi
           temp_monitor.py
 
       - name: Upload EXE artifact
@@ -58,7 +54,7 @@ jobs:
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
           git add dist/HWMonitor.exe
-          git diff --cached --quiet || git commit -m "ci: HWMonitor.exe with LHM DLL bundled [skip ci]"
+          git diff --cached --quiet || git commit -m "ci: HWMonitor.exe PowerShell+LHM [skip ci]"
           git push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
