@@ -1,0 +1,48 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches:
+      - claude/temp-monitor-exe-3bbwv2
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install psutil pyinstaller
+
+      - name: Build Windows EXE
+        run: |
+          pyinstaller --onefile --windowed --name HWMonitor --icon NONE temp_monitor.py
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HWMonitor-Windows
+          path: dist/HWMonitor.exe
+          if-no-files-found: error
+
+      - name: Move EXE to dist folder
+        run: |
+          copy dist\HWMonitor.exe dist\HWMonitor-Windows.exe
+
+      - name: Commit and push EXE
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add dist/HWMonitor.exe dist/HWMonitor-Windows.exe
+          git commit -m "ci: add compiled Windows EXE [skip ci]" || echo "Nothing to commit"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
