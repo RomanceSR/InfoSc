@@ -1,693 +1,584 @@
+"""
+HWMonitor Pro - HWiNFO / LibreHardwareMonitor tarzı sistem izleyici
+Tek kaydırılabilir pencere, sekme yok.
+Veri kaynakları: LibreHardwareMonitor WMI > psutil > nvidia-smi
+"""
 import tkinter as tk
 from tkinter import ttk
-import psutil
-import platform
-import threading
-import subprocess
-import sys
-import time
-import re
+import psutil, platform, threading, subprocess, sys, time, re
 from datetime import datetime
+from collections import OrderedDict
 
+# ─── Renk sabitleri ──────────────────────────────────────────────────────────
+BG      = "#111118"
+BG_HDR  = "#0a1628"
+BG_SHDR = "#161625"
+BG_ROW  = "#13131f"
+BG_ROW2 = "#16162a"
+FG      = "#d8d8ee"
+FGD     = "#7878a0"
+ACC     = "#0099ff"
 
-# ── Data collectors ──────────────────────────────────────────────────────────
+UNITS = {
+    "Temperature": "°C", "Fan": "RPM", "Voltage": "V",
+    "Clock": "MHz",  "Load": "%",    "Power": "W",
+    "Data": "GB",    "SmallData": "MB", "Throughput": "MB/s",
+    "Level": "%",    "Energy": "mWh",   "Factor": "x",
+    "Humidity": "%", "TimeSpan": "s",
+}
 
-def _run(cmd, timeout=3):
+HW_ORDER = [
+    "Mainboard", "SuperIO", "EmbeddedController",
+    "CPU", "GpuNvidia", "GpuAmd", "GpuIntel",
+    "Memory", "Storage", "Network",
+    "Cooler", "Psu", "Battery",
+]
+
+HW_LABELS = {
+    "Mainboard": "ANAKART", "SuperIO": "SUPER I/O",
+    "EmbeddedController": "EC",
+    "CPU": "CPU", "Memory": "BELLEK",
+    "GpuNvidia": "GPU  NVIDIA", "GpuAmd": "GPU  AMD", "GpuIntel": "GPU  INTEL",
+    "Storage": "DEPOLAMA", "Network": "AG",
+    "Cooler": "SOGUTMA", "Psu": "PSU", "Battery": "BATARYA",
+}
+
+HW_COLORS = {
+    "CPU":       "#004488", "GpuNvidia": "#285500", "GpuAmd": "#660000",
+    "GpuIntel":  "#003366", "Memory":    "#440066", "Storage": "#553300",
+    "Network":   "#005555", "Mainboard": "#2a3344", "SuperIO": "#2a3344",
+    "EmbeddedController": "#2a3344",
+    "Cooler":    "#003344", "Psu": "#443300", "Battery": "#334400",
+}
+
+# ─── Min/Max takibi ──────────────────────────────────────────────────────────
+_history = {}
+
+def track(sid, val):
+    if val is None:
+        return None, None
+    if sid not in _history:
+        _history[sid] = [val, val]
+    else:
+        if val < _history[sid][0]: _history[sid][0] = val
+        if val > _history[sid][1]: _history[sid][1] = val
+    return _history[sid][0], _history[sid][1]
+
+# ─── Değer rengi ─────────────────────────────────────────────────────────────
+def val_color(stype, val):
+    if val is None: return FGD
+    if stype == "Temperature":
+        if val >= 90: return "#ff2244"
+        if val >= 75: return "#ff6600"
+        if val >= 60: return "#ffcc00"
+        return "#00dd88"
+    if stype in ("Load", "Level"):
+        if val >= 90: return "#ff2244"
+        if val >= 75: return "#ff8800"
+        if val >= 50: return "#ffcc00"
+        return "#00dd88"
+    if stype == "Power":
+        if val >= 150: return "#ff4400"
+        if val >= 80:  return "#ff8800"
+        return "#00aaff"
+    if stype == "Fan":     return "#00bbff"
+    if stype == "Voltage": return "#ddaa00"
+    if stype == "Clock":   return "#00ccff"
+    if stype in ("Data", "SmallData"): return "#aaaaee"
+    if stype == "Throughput": return "#00ccaa"
+    return "#aaaacc"
+
+def bar_pct(stype, val):
+    if val is None: return 0
+    if stype == "Temperature":     return min(val / 110 * 100, 100)
+    if stype in ("Load", "Level"): return min(val, 100)
+    if stype == "Fan":             return min(val / 3000 * 100, 100)
+    if stype == "Clock":           return min(val / 6000 * 100, 100)
+    if stype == "Power":           return min(val / 300 * 100, 100)
+    if stype == "Voltage":         return min(val / 2.0 * 100, 100)
+    if stype == "Throughput":      return min(val / 1000 * 100, 100)
+    return 0
+
+# ─── LHM / OHM WMI ───────────────────────────────────────────────────────────
+def get_lhm_data():
+    for ns in ("root/LibreHardwareMonitor", "root/OpenHardwareMonitor"):
+        try:
+            import wmi
+            w = wmi.WMI(namespace=ns)
+            hw_map = OrderedDict()
+            try:
+                for hw in w.Hardware():
+                    hw_map[hw.Identifier] = {
+                        "id": hw.Identifier, "name": hw.Name,
+                        "type": hw.HardwareType,
+                        "parent": getattr(hw, "Parent", ""),
+                        "sensors": [],
+                    }
+            except Exception:
+                pass
+            try:
+                for s in w.Sensor():
+                    if s.Value is None:
+                        continue
+                    pid = s.Parent
+                    if pid not in hw_map:
+                        hw_map[pid] = {"id": pid, "name": pid,
+                                       "type": "Unknown", "parent": "", "sensors": []}
+                    hw_map[pid]["sensors"].append({
+                        "id":    s.Identifier,
+                        "name":  s.Name,
+                        "type":  s.SensorType,
+                        "value": s.Value,
+                        "unit":  UNITS.get(s.SensorType, ""),
+                    })
+            except Exception:
+                pass
+            if hw_map:
+                return hw_map, True
+        except Exception:
+            pass
+    return {}, False
+
+# ─── nvidia-smi ──────────────────────────────────────────────────────────────
+def get_nvidia_data():
     try:
-        flags = 0x08000000 if sys.platform == 'win32' else 0
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, creationflags=flags)
-        return r.stdout.strip()
+        flags = 0x08000000 if sys.platform == "win32" else 0
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=index,name,temperature.gpu,utilization.gpu,"
+             "memory.used,memory.total,memory.free,fan.speed,"
+             "power.draw,clocks.gr,clocks.mem",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4, creationflags=flags
+        ).stdout.strip()
     except Exception:
-        return ""
+        return {}
+    result = {}
+    for line in out.splitlines():
+        p = [x.strip() for x in line.split(",")]
+        if len(p) < 10:
+            continue
+        def sf(s):
+            try:
+                v = float(s)
+                return v if v >= 0 else None
+            except Exception:
+                return None
+        idx  = p[0]
+        name = p[1]
+        sensors = [
+            ("Temperature", f"nv{idx}_t",    "GPU Sicaklik",      sf(p[2]),  "C"),
+            ("Load",        f"nv{idx}_ul",   "GPU Core Kullanim", sf(p[3]),  "%"),
+            ("SmallData",   f"nv{idx}_muse", "VRAM Kullanilan",   sf(p[4]),  "MB"),
+            ("SmallData",   f"nv{idx}_mtot", "VRAM Toplam",       sf(p[5]),  "MB"),
+            ("SmallData",   f"nv{idx}_mfre", "VRAM Bos",          sf(p[6]),  "MB"),
+            ("Level",       f"nv{idx}_fan",  "Fan Hizi",          sf(p[7]),  "%"),
+            ("Power",       f"nv{idx}_pwr",  "GPU Guc",           sf(p[8]),  "W"),
+            ("Clock",       f"nv{idx}_gcc",  "Core Clock",        sf(p[9]),  "MHz"),
+            ("Clock",       f"nv{idx}_gmc",  "Memory Clock",      sf(p[10]), "MHz"),
+        ]
+        result[f"__nv_{idx}__"] = {
+            "id": f"__nv_{idx}__", "name": name,
+            "type": "GpuNvidia", "parent": "",
+            "sensors": [
+                {"id": sid, "name": sname, "type": stype, "value": sval, "unit": unit}
+                for stype, sid, sname, sval, unit in sensors
+                if sval is not None
+            ],
+        }
+    return result
 
+# ─── psutil verileri ─────────────────────────────────────────────────────────
+_prev_net   = None
+_prev_net_t = None
 
-def _safe_float(s):
+def get_psutil_data():
+    global _prev_net, _prev_net_t
+    result = {}
+    now = time.time()
+
+    # CPU
+    cpu_tot  = psutil.cpu_percent()
+    cpu_pcts = psutil.cpu_percent(percpu=True)
+    freq     = psutil.cpu_freq()
+    cpu_sens = [
+        {"id": "ps_cpu_tot", "name": "CPU Toplam Kullanim",
+         "type": "Load", "value": cpu_tot, "unit": "%"},
+    ]
+    for i, p in enumerate(cpu_pcts):
+        cpu_sens.append({
+            "id": f"ps_core{i}", "name": f"CPU Core #{i}",
+            "type": "Load", "value": p, "unit": "%",
+        })
+    if freq:
+        cpu_sens.append({
+            "id": "ps_freq", "name": "CPU Frekans",
+            "type": "Clock", "value": round(freq.current), "unit": "MHz",
+        })
+    result["__ps_cpu__"] = {
+        "id": "__ps_cpu__",
+        "name": platform.processor()[:70] or "CPU",
+        "type": "CPU", "parent": "", "sensors": cpu_sens,
+    }
+
+    # Bellek
+    m = psutil.virtual_memory()
+    s = psutil.swap_memory()
+    result["__ps_mem__"] = {
+        "id": "__ps_mem__", "name": "Bellek", "type": "Memory", "parent": "",
+        "sensors": [
+            {"id": "ps_ram_used",  "name": "RAM Kullanilan",  "type": "Data",  "value": round(m.used/1024**3, 2),      "unit": "GB"},
+            {"id": "ps_ram_avail", "name": "RAM Musait",      "type": "Data",  "value": round(m.available/1024**3, 2), "unit": "GB"},
+            {"id": "ps_ram_total", "name": "RAM Toplam",      "type": "Data",  "value": round(m.total/1024**3, 2),     "unit": "GB"},
+            {"id": "ps_ram_load",  "name": "RAM Kullanim",    "type": "Load",  "value": m.percent,                     "unit": "%"},
+            {"id": "ps_swp_used",  "name": "Sanal Kullanilan","type": "Data",  "value": round(s.used/1024**3, 2),      "unit": "GB"},
+            {"id": "ps_swp_load",  "name": "Sanal Kullanim",  "type": "Load",  "value": s.percent,                     "unit": "%"},
+        ],
+    }
+
+    # Diskler
+    for part in psutil.disk_partitions(all=False):
+        try:
+            u   = psutil.disk_usage(part.mountpoint)
+            dev = re.sub(r'[\\/:*?"<>|]', '_', part.device)
+            result[f"__ps_disk_{dev}__"] = {
+                "id": f"__ps_disk_{dev}__",
+                "name": f"{part.device}  ({part.mountpoint})  [{part.fstype}]",
+                "type": "Storage", "parent": "",
+                "sensors": [
+                    {"id": f"d_{dev}_use",  "name": "Kullanilan", "type": "Data",  "value": round(u.used/1024**3, 2),  "unit": "GB"},
+                    {"id": f"d_{dev}_free", "name": "Bos",        "type": "Data",  "value": round(u.free/1024**3, 2),  "unit": "GB"},
+                    {"id": f"d_{dev}_tot",  "name": "Toplam",     "type": "Data",  "value": round(u.total/1024**3, 2), "unit": "GB"},
+                    {"id": f"d_{dev}_pct",  "name": "Kullanim",   "type": "Level", "value": u.percent,                 "unit": "%"},
+                ],
+            }
+        except Exception:
+            pass
+
+    # Ag hizlari
     try:
-        v = float(str(s).strip())
-        return v if v >= 0 else None
-    except Exception:
-        return None
-
-
-def get_cpu_temps():
-    temps = {}
-    # Linux / macOS via psutil
-    try:
-        sensors = psutil.sensors_temperatures()
-        for chip, entries in sensors.items():
-            for e in entries:
-                lbl = e.label or chip
-                temps[f"{chip} / {lbl}"] = {
-                    "val": e.current, "high": e.high, "crit": e.critical}
+        cur_net = psutil.net_io_counters(pernic=True)
+        if _prev_net is not None:
+            dt = now - _prev_net_t
+            for nic, st in cur_net.items():
+                if nic not in _prev_net or dt <= 0:
+                    continue
+                dl   = max(0, (st.bytes_recv - _prev_net[nic].bytes_recv) / dt)
+                ul   = max(0, (st.bytes_sent - _prev_net[nic].bytes_sent) / dt)
+                safe = re.sub(r'[^a-zA-Z0-9]', '_', nic)
+                result[f"__ps_net_{safe}__"] = {
+                    "id": f"__ps_net_{safe}__", "name": nic,
+                    "type": "Network", "parent": "",
+                    "sensors": [
+                        {"id": f"n_{safe}_dl",  "name": "Download",          "type": "Throughput", "value": round(dl/1024**2, 3),            "unit": "MB/s"},
+                        {"id": f"n_{safe}_ul",  "name": "Upload",            "type": "Throughput", "value": round(ul/1024**2, 3),            "unit": "MB/s"},
+                        {"id": f"n_{safe}_tdl", "name": "Toplam Indirilen",  "type": "Data",       "value": round(st.bytes_recv/1024**3, 3), "unit": "GB"},
+                        {"id": f"n_{safe}_tul", "name": "Toplam Yuklenen",   "type": "Data",       "value": round(st.bytes_sent/1024**3, 3), "unit": "GB"},
+                    ],
+                }
+        _prev_net   = cur_net
+        _prev_net_t = now
     except Exception:
         pass
 
-    # Windows: WMI thermal zones
-    if not temps and sys.platform == 'win32':
+    return result
+
+# ─── Veri birleştirme ────────────────────────────────────────────────────────
+def collect_all():
+    lhm_data, lhm_ok = get_lhm_data()
+    ps_data           = get_psutil_data()
+    nv_data           = get_nvidia_data()
+
+    merged = OrderedDict()
+
+    def hw_sort_key(item):
         try:
-            import wmi
-            w = wmi.WMI(namespace="root/wmi")
-            for tz in w.MSAcpi_ThermalZoneTemperature():
-                c = (tz.CurrentTemperature / 10.0) - 273.15
-                name = tz.InstanceName.split('\\')[-1]
-                temps[f"Termal / {name}"] = {"val": c, "high": None, "crit": None}
-        except Exception:
-            pass
+            return HW_ORDER.index(item[1].get("type", ""))
+        except ValueError:
+            return 99
 
-    # Windows: LibreHardwareMonitor / OpenHardwareMonitor WMI bridge
-    if sys.platform == 'win32':
-        for ns in ("root/LibreHardwareMonitor", "root/OpenHardwareMonitor"):
-            try:
-                import wmi
-                w = wmi.WMI(namespace=ns)
-                for s in w.Sensor():
-                    if s.SensorType == 'Temperature' and s.Value is not None:
-                        temps[f"{s.Parent.split('/')[-1]} / {s.Name}"] = {
-                            "val": s.Value, "high": None, "crit": None}
-            except Exception:
-                pass
+    if lhm_ok:
+        for hid, hdata in sorted(lhm_data.items(), key=hw_sort_key):
+            if hdata.get("sensors"):
+                merged[hid] = hdata
+        lhm_types = {v.get("type", "") for v in lhm_data.values()}
+        if "GpuNvidia" not in lhm_types:
+            merged.update(nv_data)
+        # Bellek, disk, ag her zaman psutil'den
+        for k, v in ps_data.items():
+            if v.get("type") in ("Memory", "Storage", "Network"):
+                if k not in merged:
+                    merged[k] = v
+    else:
+        # LHM yok: tümü psutil + nvidia
+        for k, v in sorted(ps_data.items(),
+                            key=lambda x: hw_sort_key((x[0], x[1]))):
+            merged[k] = v
+        merged.update(nv_data)
 
-    return temps
+    return merged, lhm_ok
 
-
-def get_gpu_info():
-    gpus = []
-
-    # NVIDIA via nvidia-smi
-    out = _run(["nvidia-smi",
-                "--query-gpu=name,temperature.gpu,utilization.gpu,"
-                "memory.used,memory.total,fan.speed,power.draw",
-                "--format=csv,noheader,nounits"])
-    if out:
-        for line in out.splitlines():
-            p = [x.strip() for x in line.split(',')]
-            if len(p) >= 5:
-                gpus.append({
-                    "name":      p[0],
-                    "vendor":    "NVIDIA",
-                    "temp":      _safe_float(p[1]),
-                    "util":      _safe_float(p[2]),
-                    "mem_used":  _safe_float(p[3]),
-                    "mem_total": _safe_float(p[4]),
-                    "fan":       _safe_float(p[5]) if len(p) > 5 else None,
-                    "power":     _safe_float(p[6]) if len(p) > 6 else None,
-                })
-
-    # AMD via rocm-smi
-    if not gpus:
-        out2 = _run(["rocm-smi", "--showtemp", "--showuse"])
-        if out2:
-            temp_m = re.search(r'Temperature.*?:\s*([\d.]+)', out2)
-            use_m  = re.search(r'GPU use.*?:\s*([\d.]+)', out2)
-            gpus.append({
-                "name":      "AMD GPU (rocm-smi)",
-                "vendor":    "AMD",
-                "temp":      float(temp_m.group(1)) if temp_m else None,
-                "util":      float(use_m.group(1))  if use_m  else None,
-                "mem_used":  None, "mem_total": None, "fan": None, "power": None,
-            })
-
-    # Windows WMI fallback — name only
-    if not gpus and sys.platform == 'win32':
-        try:
-            import wmi
-            w = wmi.WMI()
-            for g in w.Win32_VideoController():
-                if not g.Name:
-                    continue
-                ram = int(g.AdapterRAM or 0) // (1024 * 1024)
-                gpus.append({
-                    "name":      g.Name,
-                    "vendor":    "Unknown",
-                    "temp":      None,
-                    "util":      None,
-                    "mem_used":  None,
-                    "mem_total": ram or None,
-                    "fan":       None,
-                    "power":     None,
-                })
-        except Exception:
-            pass
-
-    return gpus
-
-
-def get_motherboard():
-    if sys.platform == 'win32':
-        try:
-            import wmi
-            w = wmi.WMI()
-            for b in w.Win32_BaseBoard():
-                return {
-                    "manufacturer": b.Manufacturer or "N/A",
-                    "product":      b.Product      or "N/A",
-                }
-        except Exception:
-            pass
-    return {"manufacturer": "N/A", "product": "N/A"}
-
-
-def get_cpu_info():
-    mb   = get_motherboard()
-    freq = psutil.cpu_freq()
-    return {
-        "model":    platform.processor() or "N/A",
-        "cores_p":  psutil.cpu_count(logical=False) or "N/A",
-        "cores_l":  psutil.cpu_count(logical=True)  or "N/A",
-        "freq_cur": f"{freq.current:.0f} MHz" if freq else "N/A",
-        "freq_max": f"{freq.max:.0f} MHz"     if freq else "N/A",
-        "os":       f"{platform.system()} {platform.release()}",
-        "arch":     platform.machine(),
-        "mb_make":  mb["manufacturer"],
-        "mb_model": mb["product"],
-    }
-
-
-def get_mem_info():
-    m = psutil.virtual_memory()
-    s = psutil.swap_memory()
-    return {
-        "total":  f"{m.total/1024**3:.1f} GB",
-        "used":   f"{m.used/1024**3:.1f} GB",
-        "avail":  f"{m.available/1024**3:.1f} GB",
-        "pct":    m.percent,
-        "stotal": f"{s.total/1024**3:.1f} GB",
-        "sused":  f"{s.used/1024**3:.1f} GB",
-        "spct":   s.percent,
-    }
-
-
-def get_disk_info():
-    disks = []
-    for part in psutil.disk_partitions(all=False):
-        try:
-            u = psutil.disk_usage(part.mountpoint)
-            disks.append({
-                "dev":   part.device,
-                "mp":    part.mountpoint,
-                "fs":    part.fstype,
-                "total": f"{u.total/1024**3:.1f} GB",
-                "used":  f"{u.used/1024**3:.1f} GB",
-                "free":  f"{u.free/1024**3:.1f} GB",
-                "pct":   u.percent,
-            })
-        except Exception:
-            pass
-    return disks
-
-
-_prev_net      = None
-_prev_net_time = None
-
-
-def get_net_speed():
-    global _prev_net, _prev_net_time
-    now = time.time()
-    cur = psutil.net_io_counters()
-    if _prev_net is None:
-        _prev_net, _prev_net_time = cur, now
-        return {"dl": 0, "ul": 0, "tdl": cur.bytes_recv, "tul": cur.bytes_sent}
-    dt = now - _prev_net_time
-    dl = max(0, (cur.bytes_recv - _prev_net.bytes_recv) / dt) if dt else 0
-    ul = max(0, (cur.bytes_sent - _prev_net.bytes_sent) / dt) if dt else 0
-    _prev_net, _prev_net_time = cur, now
-    return {"dl": dl, "ul": ul, "tdl": cur.bytes_recv, "tul": cur.bytes_sent}
-
-
-def fmt_speed(bps):
-    if bps < 1024:     return f"{bps:.0f} B/s"
-    if bps < 1024**2:  return f"{bps/1024:.1f} KB/s"
-    if bps < 1024**3:  return f"{bps/1024**2:.1f} MB/s"
-    return f"{bps/1024**3:.2f} GB/s"
-
-
-def fmt_bytes(b):
-    if b < 1024**2:  return f"{b/1024:.1f} KB"
-    if b < 1024**3:  return f"{b/1024**2:.1f} MB"
-    return f"{b/1024**3:.2f} GB"
-
-
-# ── Colors ───────────────────────────────────────────────────────────────────
-
-def temp_color(v, high=None, crit=None):
-    if v is None:                           return "#888899"
-    if (crit and v >= crit) or v >= 90:    return "#FF2244"
-    if (high and v >= high) or v >= 70:    return "#FF8800"
-    if v >= 50:                             return "#FFDD00"
-    return "#00DD88"
-
-
-def pct_color(v):
-    if v is None:  return "#888899"
-    if v >= 90:    return "#FF2244"
-    if v >= 70:    return "#FF8800"
-    if v >= 50:    return "#FFDD00"
-    return "#00DD88"
-
-
-# ── Widgets ──────────────────────────────────────────────────────────────────
-
-BG  = "#0d0d1a"
-BG2 = "#1a1a2e"
-BG3 = "#16213e"
-ACC = "#00aaff"
-FG  = "#ddddff"
-FGD = "#aaaacc"
-
-
-class Bar(tk.Canvas):
-    def __init__(self, parent, w=260, h=16, **kw):
-        super().__init__(parent, width=w, height=h, bg=BG2,
-                         highlightthickness=0, **kw)
-        self._bar_w, self._bar_h = w, h  # _w/_h are reserved by tkinter internals
-
-    def set_val(self, pct, color="#00DD88", label=None):
-        self.delete("all")
-        self.create_rectangle(0, 0, self._bar_w, self._bar_h,
-                              fill="#2a2a3e", outline="#333355")
-        fw = int(self._bar_w * min(max(pct, 0), 100) / 100)
-        if fw:
-            self.create_rectangle(0, 0, fw, self._bar_h, fill=color, outline="")
-        txt = label or f"{pct:.0f}%"
-        self.create_text(self._bar_w // 2, self._bar_h // 2, text=txt,
-                         fill="white", font=("Consolas", 8, "bold"))
-
-
-# ── App ──────────────────────────────────────────────────────────────────────
-
-class HWMonitor(tk.Tk):
+# ─── Ana Uygulama ─────────────────────────────────────────────────────────────
+class HWMonitorPro(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("HWMonitor - Sistem Sicaklik Izleyici")
-        self.geometry("980x720")
+        self.title("HWMonitor Pro")
+        self.geometry("900x900")
         self.configure(bg=BG)
         self.resizable(True, True)
 
-        self._temp_rows = {}
-        self._gpu_rows  = {}
-        self._disk_rows = []
+        self._hw_frames   = {}   # hw_id -> (hdr_frame, body_frame)
+        self._sensor_rows = {}   # sensor_id -> (row, val_lbl, min_lbl, max_lbl, bar_cv)
+        self._row_count   = 0
 
-        self._build_ui()
+        self._build_chrome()
         self._refresh()
 
-    # ── UI ───────────────────────────────────────────────────────────────────
+    # ── Chrome ───────────────────────────────────────────────────────────────
+    def _build_chrome(self):
+        # Baslik
+        top = tk.Frame(self, bg=BG_HDR, pady=8)
+        top.pack(fill="x")
+        tk.Label(top, text="  HWMonitor Pro",
+                 font=("Consolas", 15, "bold"), fg=ACC, bg=BG_HDR).pack(side="left", padx=12)
+        self._lbl_time = tk.Label(top, text="", font=("Consolas", 9), fg=FGD, bg=BG_HDR)
+        self._lbl_time.pack(side="right", padx=12)
 
-    def _scrollable(self, parent):
-        c  = tk.Canvas(parent, bg=BG, highlightthickness=0)
-        sb = ttk.Scrollbar(parent, orient="vertical", command=c.yview)
-        f  = tk.Frame(c, bg=BG)
-        f.bind("<Configure>",
-               lambda e: c.configure(scrollregion=c.bbox("all")))
-        c.create_window((0, 0), window=f, anchor="nw")
-        c.configure(yscrollcommand=sb.set)
-        c.pack(side="left", fill="both", expand=True)
+        # Ozet seridi
+        sumbar = tk.Frame(self, bg=BG_SHDR, pady=5)
+        sumbar.pack(fill="x")
+        self._sum_cpu  = self._sum_chip(sumbar, "CPU")
+        self._sum_gpu  = self._sum_chip(sumbar, "GPU")
+        self._sum_ram  = self._sum_chip(sumbar, "RAM")
+        self._sum_ctemp = self._sum_chip(sumbar, "CPU TEMP")
+        self._sum_gtemp = self._sum_chip(sumbar, "GPU TEMP")
+
+        # LHM uyari bandi (baslangicta gizli)
+        self._banner_frame = tk.Frame(self, bg="#200800", pady=4)
+        tk.Label(
+            self._banner_frame,
+            text=("  UYARI: LibreHardwareMonitor calismıyor → CPU / GPU sicaklıkları gorunmez.\n"
+                  "  Cozum: LibreHardwareMonitor'u indirin, YONETICI olarak baslatın, sonra bu programı yeniden baslatın."),
+            font=("Consolas", 8), fg="#ff9933", bg="#200800",
+            anchor="w", justify="left",
+        ).pack(fill="x", padx=10)
+        self._banner_visible = False
+
+        # Sutun basliklari
+        col_hdr = tk.Frame(self, bg=BG_SHDR, pady=3)
+        col_hdr.pack(fill="x", padx=6)
+        for text, w in (("Sensor Adi", 42), ("Deger", 12), ("Min", 11), ("Max", 11), ("", 21)):
+            tk.Label(col_hdr, text=text, font=("Consolas", 8, "bold"),
+                     fg=FGD, bg=BG_SHDR, width=w, anchor="w").pack(side="left")
+
+        # Kaydirilebilir alan
+        outer = tk.Frame(self, bg=BG)
+        outer.pack(fill="both", expand=True, padx=4, pady=2)
+        self._canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=self._canvas.yview)
+        self._sf = tk.Frame(self._canvas, bg=BG)
+        self._sf.bind("<Configure>",
+                      lambda e: self._canvas.configure(
+                          scrollregion=self._canvas.bbox("all")))
+        self._canvas.create_window((0, 0), window=self._sf, anchor="nw")
+        self._canvas.configure(yscrollcommand=sb.set)
+        self._canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        c.bind_all("<MouseWheel>",
-                   lambda e: c.yview_scroll(-1*(e.delta//120), "units"))
-        return f
+        self._canvas.bind("<MouseWheel>",
+                          lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
+        self._sf.bind("<MouseWheel>",
+                      lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
 
-    def _sec(self, parent, title):
-        f = tk.Frame(parent, bg=BG3, pady=5)
-        f.pack(fill="x", padx=8, pady=(10, 2))
-        tk.Label(f, text=f"  {title}", font=("Consolas", 10, "bold"),
-                 fg=ACC, bg=BG3, anchor="w").pack(fill="x", padx=6)
-
-    def _lrow(self, parent, label, val="—", wl=30, wv=24):
-        f = tk.Frame(parent, bg=BG2)
-        f.pack(fill="x", padx=14, pady=1)
-        tk.Label(f, text=label, font=("Consolas", 9), fg=FGD,
-                 bg=BG2, width=wl, anchor="w").pack(side="left")
-        v = tk.Label(f, text=val, font=("Consolas", 9, "bold"),
-                     fg=FG, bg=BG2, width=wv, anchor="w")
-        v.pack(side="left")
+    def _sum_chip(self, parent, label):
+        f = tk.Frame(parent, bg=BG_SHDR, padx=14)
+        f.pack(side="left")
+        tk.Label(f, text=label, font=("Consolas", 7), fg=FGD, bg=BG_SHDR).pack()
+        v = tk.Label(f, text="—", font=("Consolas", 11, "bold"), fg=FG, bg=BG_SHDR)
+        v.pack()
         return v
 
-    def _build_ui(self):
-        # header
-        hdr = tk.Frame(self, bg=BG3, pady=8)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="  HWMonitor", font=("Consolas", 17, "bold"),
-                 fg=ACC, bg=BG3).pack(side="left", padx=14)
-        self._lbl_time = tk.Label(hdr, text="", font=("Consolas", 9),
-                                   fg="#666677", bg=BG3)
-        self._lbl_time.pack(side="right", padx=14)
-
-        # CPU bar strip
-        strip = tk.Frame(self, bg=BG, pady=5)
-        strip.pack(fill="x", padx=14)
-        tk.Label(strip, text="CPU:", font=("Consolas", 10),
-                 fg=FGD, bg=BG).pack(side="left")
-        self._cpu_bar = Bar(strip, w=380, h=20)
-        self._cpu_bar.pack(side="left", padx=8)
-        self._cpu_pct = tk.Label(strip, text="0%", font=("Consolas", 10, "bold"),
-                                  fg=ACC, bg=BG, width=8)
-        self._cpu_pct.pack(side="left")
-
-        # notebook
-        sty = ttk.Style(self)
-        sty.theme_use("clam")
-        sty.configure("D.TNotebook",     background=BG,  borderwidth=0)
-        sty.configure("D.TNotebook.Tab", background=BG3, foreground=FGD,
-                      padding=[12, 5],   font=("Consolas", 9, "bold"))
-        sty.map("D.TNotebook.Tab",
-                background=[("selected", "#0f3460")],
-                foreground=[("selected", ACC)])
-
-        nb = ttk.Notebook(self, style="D.TNotebook")
-        nb.pack(fill="both", expand=True, padx=8, pady=4)
-
-        tabs = {}
-        for name in ("Sicakliklar", "GPU", "CPU", "Bellek", "Disk", "Ag"):
-            f = tk.Frame(nb, bg=BG)
-            nb.add(f, text=f"  {name}  ")
-            tabs[name] = f
-
-        self._build_temp_tab(tabs["Sicakliklar"])
-        self._build_gpu_tab(tabs["GPU"])
-        self._build_cpu_tab(tabs["CPU"])
-        self._build_mem_tab(tabs["Bellek"])
-        self._build_disk_tab(tabs["Disk"])
-        self._build_net_tab(tabs["Ag"])
-
-    def _build_temp_tab(self, parent):
-        self._temp_scroll = self._scrollable(parent)
-        self._sec(self._temp_scroll, "CPU / Sistem Sicakliklari")
-        self._temp_empty = tk.Label(
-            self._temp_scroll,
-            text=("  Sensor verisi bulunamadi.\n"
-                  "  Windows icin: LibreHardwareMonitor'i yonetici olarak calistirin,\n"
-                  "  sonra bu programi yeniden baslatın."),
-            font=("Consolas", 9), fg="#666677", bg=BG, justify="left")
-        self._temp_empty.pack(anchor="w", padx=16, pady=8)
-
-    def _build_gpu_tab(self, parent):
-        self._gpu_scroll = self._scrollable(parent)
-        self._sec(self._gpu_scroll, "Grafik Karti")
-        self._gpu_empty = tk.Label(
-            self._gpu_scroll,
-            text=("  GPU verisi alinamadi.\n"
-                  "  NVIDIA: nvidia-smi PATH'te olmali.\n"
-                  "  AMD: rocm-smi gerekli.\n"
-                  "  Her iki GPU da WMI ile temel bilgi gosterilir."),
-            font=("Consolas", 9), fg="#666677", bg=BG, justify="left")
-        self._gpu_empty.pack(anchor="w", padx=16, pady=8)
-
-    def _build_cpu_tab(self, parent):
-        frame = self._scrollable(parent)
-        self._sec(frame, "Islemci Bilgileri")
-        info = get_cpu_info()
-        self._lrow(frame, "Model:",             info["model"])
-        self._lrow(frame, "Fiziksel Cekirdek:", str(info["cores_p"]))
-        self._lrow(frame, "Mantiksal Cekirdek:",str(info["cores_l"]))
-        self._freq_lbl = self._lrow(frame, "Mevcut Frekans:")
-        self._lrow(frame, "Maks. Frekans:",    info["freq_max"])
-        self._lrow(frame, "Isletim Sistemi:",  info["os"])
-        self._lrow(frame, "Mimari:",            info["arch"])
-
-        self._sec(frame, "Anakart")
-        self._lrow(frame, "Uretici:",  info["mb_make"])
-        self._lrow(frame, "Model:",    info["mb_model"])
-
-        self._sec(frame, "Cekirdek Kullanimi")
-        self._core_bars = []
-        for i in range(psutil.cpu_count(logical=True) or 1):
-            row = tk.Frame(frame, bg=BG2)
-            row.pack(fill="x", padx=14, pady=1)
-            tk.Label(row, text=f"Cekirdek {i:>2}:", font=("Consolas", 9),
-                     fg=FGD, bg=BG2, width=14, anchor="w").pack(side="left")
-            bar = Bar(row, w=300, h=15)
-            bar.pack(side="left", padx=4)
-            lbl = tk.Label(row, text="0%", font=("Consolas", 9, "bold"),
-                           fg=ACC, bg=BG2, width=6)
-            lbl.pack(side="left")
-            self._core_bars.append((bar, lbl))
-
-    def _build_mem_tab(self, parent):
-        frame = self._scrollable(parent)
-        self._sec(frame, "RAM Bellek")
-        self._ml = {
-            "total": self._lrow(frame, "Toplam RAM:"),
-            "used":  self._lrow(frame, "Kullanilan:"),
-            "avail": self._lrow(frame, "Musait:"),
-            "pct":   self._lrow(frame, "Kullanim %:"),
-        }
-        mrow = tk.Frame(frame, bg=BG2)
-        mrow.pack(fill="x", padx=14, pady=3)
-        tk.Label(mrow, text="Kullanim:", font=("Consolas", 9),
-                 fg=FGD, bg=BG2, width=30, anchor="w").pack(side="left")
-        self._mem_bar = Bar(mrow, w=380, h=18)
-        self._mem_bar.pack(side="left")
-
-        self._sec(frame, "Swap")
-        self._sl = {
-            "stotal": self._lrow(frame, "Toplam Swap:"),
-            "sused":  self._lrow(frame, "Kullanilan:"),
-            "spct":   self._lrow(frame, "Kullanim %:"),
-        }
-        srow = tk.Frame(frame, bg=BG2)
-        srow.pack(fill="x", padx=14, pady=3)
-        tk.Label(srow, text="Kullanim:", font=("Consolas", 9),
-                 fg=FGD, bg=BG2, width=30, anchor="w").pack(side="left")
-        self._swap_bar = Bar(srow, w=380, h=18)
-        self._swap_bar.pack(side="left")
-
-    def _build_disk_tab(self, parent):
-        self._disk_scroll = self._scrollable(parent)
-
-    def _build_net_tab(self, parent):
-        frame = self._scrollable(parent)
-        self._sec(frame, "Anlik Hiz")
-        self._nl = {
-            "dl":  self._lrow(frame, "Download:"),
-            "ul":  self._lrow(frame, "Upload:"),
-            "tdl": self._lrow(frame, "Toplam Indirilen:"),
-            "tul": self._lrow(frame, "Toplam Yuklenen:"),
-        }
-        self._sec(frame, "Ag Arayuzleri")
-        for iface, addrs in psutil.net_if_addrs().items():
-            row = tk.Frame(frame, bg=BG2)
-            row.pack(fill="x", padx=14, pady=1)
-            tk.Label(row, text=iface, font=("Consolas", 9, "bold"),
-                     fg=ACC, bg=BG2, width=22, anchor="w").pack(side="left")
-            ip = next((a.address for a in addrs
-                       if str(getattr(a, 'family', '')) in
-                       ('AddressFamily.AF_INET', '2',
-                        '<AddressFamily.AF_INET: 2>')), "")
-            tk.Label(row, text=ip or "—", font=("Consolas", 9),
-                     fg=FG, bg=BG2).pack(side="left")
-
     # ── Refresh ──────────────────────────────────────────────────────────────
-
     def _refresh(self):
-        self._lbl_time.config(
-            text=datetime.now().strftime("Son guncelleme: %H:%M:%S"))
+        self._lbl_time.config(text=datetime.now().strftime("%H:%M:%S"))
         threading.Thread(target=self._worker, daemon=True).start()
         self.after(2000, self._refresh)
 
     def _worker(self):
         try:
-            data = {
-                "cpu_pct":   psutil.cpu_percent(),
-                "core_pcts": psutil.cpu_percent(percpu=True),
-                "freq":      psutil.cpu_freq(),
-                "mem":       get_mem_info(),
-                "disks":     get_disk_info(),
-                "net":       get_net_speed(),
-                "temps":     get_cpu_temps(),
-                "gpus":      get_gpu_info(),
-            }
-            self.after(0, lambda d=data: self._apply(d))
+            data, lhm_ok = collect_all()
+            self.after(0, lambda d=data, ok=lhm_ok: self._apply(d, ok))
         except Exception:
             pass
 
-    def _apply(self, d):
-        # CPU bar
-        p   = d["cpu_pct"]
-        col = pct_color(p)
-        self._cpu_bar.set_val(p, col)
-        self._cpu_pct.config(text=f"{p:.1f}%", fg=col)
+    def _apply(self, data, lhm_ok):
+        # Banner goster/gizle
+        if lhm_ok and self._banner_visible:
+            self._banner_frame.pack_forget()
+            self._banner_visible = False
+        elif not lhm_ok and not self._banner_visible:
+            self._banner_frame.pack(fill="x", before=self._sf.master.master)
+            self._banner_visible = True
 
-        if d["freq"] and hasattr(self, "_freq_lbl"):
-            self._freq_lbl.config(text=f"{d['freq'].current:.0f} MHz")
+        # Ozet degerleri
+        cpu_load = gpu_load = ram_load = cpu_temp = gpu_temp = None
+        for hdata in data.values():
+            ht = hdata.get("type", "")
+            for s in hdata.get("sensors", []):
+                st  = s["type"]
+                sv  = s["value"]
+                sid = s["id"]
+                if sv is None:
+                    continue
+                if cpu_load is None and st == "Load" and ht == "CPU":
+                    if "total" in s["name"].lower() or "toplam" in s["name"].lower():
+                        cpu_load = sv
+                if gpu_load is None and st == "Load" and "Gpu" in ht:
+                    if "core" in s["name"].lower() or "kullanim" in s["name"].lower():
+                        gpu_load = sv
+                if ram_load is None and st == "Load" and ht == "Memory":
+                    ram_load = sv
+                if cpu_temp is None and st == "Temperature" and ht == "CPU":
+                    if "package" in s["name"].lower() or "tdie" in s["name"].lower() or "sicaklik" in s["name"].lower():
+                        cpu_temp = sv
+                    elif cpu_temp is None:
+                        cpu_temp = sv
+                if gpu_temp is None and st == "Temperature" and "Gpu" in ht:
+                    gpu_temp = sv
 
-        for i, (bar, lbl) in enumerate(self._core_bars):
-            if i < len(d["core_pcts"]):
-                cp  = d["core_pcts"][i]
-                cc  = pct_color(cp)
-                bar.set_val(cp, cc)
-                lbl.config(text=f"{cp:.0f}%", fg=cc)
-
-        m = d["mem"]
-        self._ml["total"].config(text=m["total"])
-        self._ml["used"].config(text=m["used"],
-                                fg="#FF8800" if m["pct"] > 80 else "#00DD88")
-        self._ml["avail"].config(text=m["avail"])
-        self._ml["pct"].config(text=f"{m['pct']}%", fg=pct_color(m["pct"]))
-        self._mem_bar.set_val(m["pct"], pct_color(m["pct"]))
-        self._sl["stotal"].config(text=m["stotal"])
-        self._sl["sused"].config(text=m["sused"])
-        self._sl["spct"].config(text=f"{m['spct']}%", fg=pct_color(m["spct"]))
-        self._swap_bar.set_val(m["spct"], pct_color(m["spct"]))
-
-        self._update_disks(d["disks"])
-
-        n = d["net"]
-        self._nl["dl"].config(text=fmt_speed(n["dl"]),  fg="#00DDFF")
-        self._nl["ul"].config(text=fmt_speed(n["ul"]),  fg="#FFAA00")
-        self._nl["tdl"].config(text=fmt_bytes(n["tdl"]))
-        self._nl["tul"].config(text=fmt_bytes(n["tul"]))
-
-        self._update_temps(d["temps"])
-        self._update_gpus(d["gpus"])
-
-    # ── Disk (no rebuild) ────────────────────────────────────────────────────
-
-    def _update_disks(self, disks):
-        for i, disk in enumerate(disks):
-            if i >= len(self._disk_rows):
-                sec = tk.Frame(self._disk_scroll, bg=BG3, pady=4)
-                sec.pack(fill="x", padx=8, pady=(8, 1))
-                name_lbl = tk.Label(sec, text="", font=("Consolas", 9, "bold"),
-                                    fg=ACC, bg=BG3, anchor="w")
-                name_lbl.pack(fill="x", padx=8)
-
-                vals = {}
-                for key, lbl in (("fs", "Dosya Sistemi:"), ("total", "Toplam:"),
-                                  ("used", "Kullanilan:"),  ("free", "Bos:")):
-                    row = tk.Frame(self._disk_scroll, bg=BG2)
-                    row.pack(fill="x", padx=14, pady=1)
-                    tk.Label(row, text=lbl, font=("Consolas", 9), fg=FGD,
-                             bg=BG2, width=20, anchor="w").pack(side="left")
-                    v = tk.Label(row, text="", font=("Consolas", 9, "bold"),
-                                 fg=FG, bg=BG2)
-                    v.pack(side="left")
-                    vals[key] = v
-
-                brow = tk.Frame(self._disk_scroll, bg=BG2)
-                brow.pack(fill="x", padx=14, pady=2)
-                tk.Label(brow, text="Kullanim:", font=("Consolas", 9), fg=FGD,
-                         bg=BG2, width=20, anchor="w").pack(side="left")
-                bar  = Bar(brow, w=340, h=18)
-                bar.pack(side="left", padx=4)
-                plbl = tk.Label(brow, text="", font=("Consolas", 9, "bold"),
-                                fg=FG, bg=BG2, width=6)
-                plbl.pack(side="left")
-
-                self._disk_rows.append((sec, name_lbl, vals, bar, plbl))
-
-            _, nlbl, vals, bar, plbl = self._disk_rows[i]
-            nlbl.config(text=f"  {disk['dev']}  ({disk['mp']})")
-            vals["fs"].config(text=disk["fs"])
-            vals["total"].config(text=disk["total"])
-            vals["used"].config(text=disk["used"])
-            vals["free"].config(text=disk["free"])
-            c = pct_color(disk["pct"])
-            bar.set_val(disk["pct"], c)
-            plbl.config(text=f"{disk['pct']}%", fg=c)
-
-    # ── Temp (no rebuild) ────────────────────────────────────────────────────
-
-    def _update_temps(self, temps):
-        if not temps:
-            self._temp_empty.pack(anchor="w", padx=16, pady=8)
-            return
-        self._temp_empty.pack_forget()
-
-        for key, data in temps.items():
-            val = data["val"]
-            col = temp_color(val, data.get("high"), data.get("crit"))
-            if key not in self._temp_rows:
-                row = tk.Frame(self._temp_scroll, bg=BG2)
-                row.pack(fill="x", padx=14, pady=1)
-                tk.Label(row, text=key[:44], font=("Consolas", 9), fg=FGD,
-                         bg=BG2, width=46, anchor="w").pack(side="left")
-                v = tk.Label(row, text="", font=("Consolas", 9, "bold"),
-                             fg=col, bg=BG2, width=12)
-                v.pack(side="left")
-                b = Bar(row, w=180, h=14)
-                b.pack(side="left", padx=4)
-                self._temp_rows[key] = (row, v, b)
-            _, vlbl, bar = self._temp_rows[key]
-            vlbl.config(text=f"{val:.1f} °C", fg=col)
-            bar.set_val(min(val, 120) / 120 * 100, col)
-
-    # ── GPU (no rebuild) ─────────────────────────────────────────────────────
-
-    def _update_gpus(self, gpus):
-        if not gpus:
-            self._gpu_empty.pack(anchor="w", padx=16, pady=8)
-            return
-        self._gpu_empty.pack_forget()
-
-        for g in gpus:
-            name = g["name"]
-            if name not in self._gpu_rows:
-                self._sec(self._gpu_scroll, name)
-                rows = {}
-                rows["vendor"] = self._lrow(self._gpu_scroll, "Uretici:",
-                                             g.get("vendor", "N/A"))
-                rows["temp"]   = self._lrow(self._gpu_scroll, "Sicaklik:")
-                rows["util"]   = self._lrow(self._gpu_scroll, "GPU Kullanim:")
-                rows["mem"]    = self._lrow(self._gpu_scroll, "VRAM:")
-                rows["fan"]    = self._lrow(self._gpu_scroll, "Fan Hizi:")
-                rows["power"]  = self._lrow(self._gpu_scroll, "Guc Tuketimi:")
-
-                brow = tk.Frame(self._gpu_scroll, bg=BG2)
-                brow.pack(fill="x", padx=14, pady=3)
-                tk.Label(brow, text="GPU Kullanim:", font=("Consolas", 9),
-                         fg=FGD, bg=BG2, width=30, anchor="w").pack(side="left")
-                rows["util_bar"] = Bar(brow, w=320, h=18)
-                rows["util_bar"].pack(side="left")
-
-                trow = tk.Frame(self._gpu_scroll, bg=BG2)
-                trow.pack(fill="x", padx=14, pady=3)
-                tk.Label(trow, text="Sicaklik:", font=("Consolas", 9),
-                         fg=FGD, bg=BG2, width=30, anchor="w").pack(side="left")
-                rows["temp_bar"] = Bar(trow, w=320, h=18)
-                rows["temp_bar"].pack(side="left")
-
-                self._gpu_rows[name] = rows
-
-            rows = self._gpu_rows[name]
-            t  = g.get("temp")
-            u  = g.get("util")
-            mu = g.get("mem_used")
-            mt = g.get("mem_total")
-            fn = g.get("fan")
-            pw = g.get("power")
-
-            rows["temp"].config(
-                text=f"{t:.1f} °C" if t is not None else "N/A",
-                fg=temp_color(t))
-            rows["util"].config(
-                text=f"{u:.0f}%" if u is not None else "N/A",
-                fg=pct_color(u) if u is not None else "#888899")
-
-            if mu is not None and mt and mt > 0:
-                rows["mem"].config(
-                    text=f"{mu:.0f} / {mt:.0f} MB",
-                    fg=pct_color(mu / mt * 100))
-            elif mt:
-                rows["mem"].config(text=f"Toplam: {mt:.0f} MB")
+        def _s(lbl, val, unit, stype):
+            if val is None:
+                lbl.config(text="N/A", fg=FGD)
             else:
-                rows["mem"].config(text="N/A")
+                lbl.config(text=f"{val:.1f}{unit}", fg=val_color(stype, val))
 
-            rows["fan"].config(
-                text=f"{fn:.0f}%" if fn is not None else "N/A")
-            rows["power"].config(
-                text=f"{pw:.1f} W" if pw is not None else "N/A")
+        _s(self._sum_cpu,   cpu_load, "%",  "Load")
+        _s(self._sum_gpu,   gpu_load, "%",  "Load")
+        _s(self._sum_ram,   ram_load, "%",  "Load")
+        _s(self._sum_ctemp, cpu_temp, "C",  "Temperature")
+        _s(self._sum_gtemp, gpu_temp, "C",  "Temperature")
 
-            rows["util_bar"].set_val(
-                u if u is not None else 0,
-                pct_color(u) if u is not None else "#444466",
-                label=f"{u:.0f}%" if u is not None else "N/A")
-            rows["temp_bar"].set_val(
-                min(t, 120) / 120 * 100 if t is not None else 0,
-                temp_color(t),
-                label=f"{t:.1f}°C" if t is not None else "N/A")
+        # Donanim bloklarini ve sensor satirlarini olustur/guncelle
+        for hw_id, hdata in data.items():
+            if not hdata.get("sensors"):
+                continue
+            if hw_id not in self._hw_frames:
+                self._create_hw_block(hw_id, hdata)
+            for s in hdata["sensors"]:
+                sid = s["id"]
+                val = s["value"]
+                if val is None:
+                    continue
+                if sid not in self._sensor_rows:
+                    self._create_sensor_row(hw_id, s)
+                if sid not in self._sensor_rows:
+                    continue
+                mn, mx  = track(sid, val)
+                unit    = s.get("unit", "")
+                stype   = s.get("type", "")
+                color   = val_color(stype, val)
+                _, vlbl, mlbl, xlbl, bar_cv = self._sensor_rows[sid]
+                vlbl.config(text=self._fmt(val, unit), fg=color)
+                if mn is not None:
+                    mlbl.config(text=self._fmt(mn, unit), fg=FGD)
+                    xlbl.config(text=self._fmt(mx, unit), fg="#ff6644")
+                pct = bar_pct(stype, val)
+                self._draw_bar(bar_cv, pct, color)
+
+    # ── Widget olusturma ─────────────────────────────────────────────────────
+    def _create_hw_block(self, hw_id, hdata):
+        hw_type = hdata.get("type", "Unknown")
+        hw_name = hdata.get("name", hw_id)
+        label   = HW_LABELS.get(hw_type, hw_type.upper())
+        color   = HW_COLORS.get(hw_type, "#2a3344")
+
+        # Bosluk + baslik
+        tk.Frame(self._sf, bg=BG, height=4).pack(fill="x")
+        hdr = tk.Frame(self._sf, bg=color, pady=4)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f"  [{label}]   {hw_name}",
+                 font=("Consolas", 9, "bold"), fg="white",
+                 bg=color, anchor="w").pack(side="left", padx=8)
+
+        # Sensor govdesi
+        body = tk.Frame(self._sf, bg=BG)
+        body.pack(fill="x")
+
+        self._hw_frames[hw_id] = (hdr, body)
+
+    def _create_sensor_row(self, hw_id, s):
+        if hw_id not in self._hw_frames:
+            return
+        _, body = self._hw_frames[hw_id]
+        sid     = s["id"]
+
+        bg = BG_ROW if self._row_count % 2 == 0 else BG_ROW2
+        self._row_count += 1
+
+        row = tk.Frame(body, bg=bg)
+        row.pack(fill="x")
+        row.bind("<MouseWheel>",
+                 lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
+
+        def mw_bind(w):
+            w.bind("<MouseWheel>",
+                   lambda e: self._canvas.yview_scroll(-1*(e.delta//120), "units"))
+
+        # Sensor adi
+        nl = tk.Label(row, text=s["name"], font=("Consolas", 9),
+                      fg=FG, bg=bg, width=44, anchor="w")
+        nl.pack(side="left", padx=(10, 2), pady=1)
+        mw_bind(nl)
+
+        # Deger
+        vl = tk.Label(row, text="—", font=("Consolas", 9, "bold"),
+                      fg=FGD, bg=bg, width=12, anchor="e")
+        vl.pack(side="left", padx=1)
+        mw_bind(vl)
+
+        # Min
+        ml = tk.Label(row, text="—", font=("Consolas", 8),
+                      fg=FGD, bg=bg, width=11, anchor="e")
+        ml.pack(side="left", padx=1)
+        mw_bind(ml)
+
+        # Max
+        xl = tk.Label(row, text="—", font=("Consolas", 8),
+                      fg="#ff6644", bg=bg, width=11, anchor="e")
+        xl.pack(side="left", padx=1)
+        mw_bind(xl)
+
+        # Bar
+        bar_cv = tk.Canvas(row, width=155, height=13, bg=bg, highlightthickness=0)
+        bar_cv.pack(side="left", padx=(4, 8))
+        mw_bind(bar_cv)
+
+        self._sensor_rows[sid] = (row, vl, ml, xl, bar_cv)
+
+    # ── Yardimcilar ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _fmt(val, unit):
+        if val is None: return "—"
+        u = unit.strip()
+        if u in ("%", "RPM"):   return f"{val:.0f} {u}"
+        if u == "MHz":          return f"{val:.0f} {u}"
+        if u == "V":            return f"{val:.3f} {u}"
+        if u in ("W", "C"):     return f"{val:.1f} {u}"
+        if u in ("GB", "MB"):   return f"{val:.2f} {u}"
+        if u == "MB/s":         return f"{val:.3f} {u}"
+        if u == "mWh":          return f"{val:.0f} {u}"
+        if val == int(val):     return f"{int(val)} {u}".strip()
+        return f"{val:.1f} {u}".strip()
+
+    @staticmethod
+    def _draw_bar(cv, pct, color):
+        cv.delete("all")
+        W, H = 155, 13
+        cv.create_rectangle(0, 0, W, H, fill="#1a1a2a", outline="#2a2a44")
+        fw = int(W * min(max(pct, 0), 100) / 100)
+        if fw:
+            cv.create_rectangle(1, 1, fw, H - 1, fill=color, outline="")
 
 
 if __name__ == "__main__":
-    app = HWMonitor()
+    app = HWMonitorPro()
     app.mainloop()
